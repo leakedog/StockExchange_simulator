@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+enum OrderSide {
+    BUY_OS = 0;
+    SELL_OS = 1;
+}
+
+enum OrderType {
+    LIMIT_ORDER = 0;
+    ICEBERG_ORDER = 1;
+}
