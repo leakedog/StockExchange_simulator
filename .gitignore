@@ -1,0 +1,7 @@
+.cache/
+./bazel-bin
+./bazel-homework
+./bazel-out
+./bazel-testlogs
+./external
+./compile_commands.json
