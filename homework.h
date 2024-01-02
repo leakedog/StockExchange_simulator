@@ -1,5 +1,7 @@
 #include <cstdint>
+#include <istream>
 #include <iterator>
+#include <limits>
 #include <ostream>
 #include <random>
 #include <vector>
@@ -17,6 +19,8 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/numbers.h"
+
 
 namespace std {
     template <>
@@ -26,8 +30,6 @@ namespace std {
         }
     };
 }
-
-
 
 
 class LimitOrder { 
@@ -40,6 +42,18 @@ protected:
 public:
     LimitOrder (OrderSide side, uint32_t id, uint16_t price, uint32_t quantity)
                 : type_(LIMIT_ORDER), side_(side), id_(id), price_(price), quantity_(quantity) {
+    }
+
+    static bool MatchesPrice(std::shared_ptr<LimitOrder> order, std::shared_ptr<LimitOrder> opposite_order) {
+        if (order->side() == BUY_OS) {
+            return order->price() >= opposite_order->price();
+        } else {
+            return order->price() <= opposite_order->price();
+        }
+    }
+
+    static uint32_t CalculatePrice(std::shared_ptr<LimitOrder> order, std::shared_ptr<LimitOrder> opposite_order) {
+        return opposite_order->price(); 
     }
 
     virtual void Fill(uint32_t other_quantity) {
@@ -72,7 +86,7 @@ public:
     uint32_t id() const {
         return id_;
     }
-
+    
     virtual ~LimitOrder() = default;
 };
 
@@ -81,7 +95,7 @@ private:
     uint32_t peak_size_;
     uint32_t hidden_full_volume_;
 public:
-    IcebergOrder(OrderSide side, uint32_t id, uint16_t price, uint32_t peak_size, uint32_t hidden_full_volume) 
+    IcebergOrder(OrderSide side, uint32_t id, uint16_t price, uint32_t hidden_full_volume, uint32_t peak_size) 
                  : LimitOrder(side, id, price, 0), peak_size_(peak_size), hidden_full_volume_(hidden_full_volume) {
         type_ = ICEBERG_ORDER;
     }
@@ -104,6 +118,44 @@ public:
 };
 
 
+class OrderParser {
+public:
+    static std::optional<std::unique_ptr<LimitOrder>> Parse(const std::string& line) {
+        auto it = std::find_if(line.begin(), line.end(), [](char c) {
+            return !std::isspace(c);
+        });
+        std::string_view considering_line(it, line.end());
+        if (considering_line.size() == 0 || considering_line.starts_with("#")) {
+            return std::nullopt;
+        }
+        std::vector<std::string> strings = absl::StrSplit(considering_line, ',');
+        if (strings.size() != 4 && strings.size() != 5) {
+           return std::nullopt; 
+        }
+        OrderSide side;
+        if (strings[0] == "B")  side = BUY_OS;
+        else if (strings[0] == "S") side = SELL_OS;
+        else LOG(FATAL) << "Unknown side during parse: " << line;
+
+        uint32_t id, quantity;
+        uint32_t price;
+
+        if (!absl::SimpleAtoi(strings[1], &id)) LOG(FATAL) << "Unknown id during parse: " << line;
+        if (!absl::SimpleAtoi(strings[2], &price)) LOG(FATAL) << "Unknown price during parse: " << line;
+        if (price >= std::numeric_limits<uint16_t>::max()) LOG(FATAL) << "Price is too large: " << line;
+        if (!absl::SimpleAtoi(strings[3], &quantity)) LOG(FATAL) << "Unknown quantity during parse: " << line;
+        if (strings.size() == 4) {  // limit order
+            return std::make_unique<LimitOrder>(side, id, price, quantity);
+        } else if (strings.size() == 5) { // iceberg order
+            uint32_t peak_size;
+            if (!absl::SimpleAtoi(strings[4], &peak_size)) LOG(FATAL) << "Unknown peak_size during parse: " << line;
+            return std::make_unique<IcebergOrder>(side, id, price, quantity, peak_size);
+        } else{
+            LOG(FATAL) << "Unreachable condition reached";
+        }
+    }
+};
+
 struct Trade {
     uint32_t buy_id; 
     uint32_t sell_id;
@@ -111,7 +163,7 @@ struct Trade {
     uint32_t quantity;
 
     std::string ToString() const {
-        return absl::StrFormat("%u, %u, %hu, %u", buy_id, sell_id, price, quantity);
+        return absl::StrFormat("%u,%u,%hu,%u", buy_id, sell_id, price, quantity);
     }
 
     friend std::ostream& operator<< (std::ostream& out, const Trade& trade) {
@@ -156,7 +208,8 @@ class OrderBook {
     OrderBookType sells_book_;
     OrderBookType buys_book_;
 public:
-    std::optional<std::shared_ptr<LimitOrder>> GetOpposite(OrderSide order_side) const {
+
+    std::optional<std::shared_ptr<LimitOrder>> GetOpposite(const OrderSide& order_side) const {
         if  (order_side == SELL_OS) {
             if (buys_book_.empty()) {
                 return std::nullopt;
@@ -169,12 +222,17 @@ public:
             return sells_book_.begin()->second.front();
         } else {
             LOG(FATAL) << absl::StrFormat("OrderSide is not supported %s", OrderSide_Name(order_side));
+            return std::nullopt;
         }
     }
 
     void Add(std::shared_ptr<LimitOrder> order) {
         if (order->quantity() == 0) {
             return;
+        }
+        auto opposite_order = GetOpposite(order->side());
+        if (opposite_order && LimitOrder::MatchesPrice(order, opposite_order.value())) {
+            LOG(FATAL) << absl::StrFormat("Adding order with price %hu while exists opposite order with price: %hu", order->price(), opposite_order.value()->price());
         }
         if (order->side() == SELL_OS) {
             sells_book_[order->price()].push_back(order);
@@ -183,7 +241,7 @@ public:
         }
     }
 
-    void PopOpposite(OrderSide order_side) {
+    void PopOpposite(const OrderSide& order_side) {
         auto deleted_order = GetOpposite(order_side).value();
         
         if  (order_side == SELL_OS) {
@@ -312,23 +370,12 @@ public:
     }
 
 private:
-    bool Matches(std::shared_ptr<LimitOrder> order, std::shared_ptr<LimitOrder> opposite_order) const {
-        if (order->side() == BUY_OS) {
-            return order->price() >= opposite_order->price();
-        } else {
-            return order->price() <= opposite_order->price();
-        }
-    }
-
-    uint32_t CalculatePrice(std::shared_ptr<LimitOrder> order, std::shared_ptr<LimitOrder> opposite_order) const {
-        return opposite_order->price();
-    }
     
     template<typename T>
     std::enable_if_t<std::is_base_of_v<LimitOrder, T>, void> ProcessOrder(std::shared_ptr<T> order) {
-        while (order->quantity() && order_book_.GetOpposite(order->side()) && Matches(order, order_book_.GetOpposite(order->side()).value())) {
+        while (order->quantity() && order_book_.GetOpposite(order->side()) && LimitOrder::MatchesPrice(order, order_book_.GetOpposite(order->side()).value())) {
             auto opposite_order = order_book_.GetOpposite(order->side()).value();
-            uint32_t price = CalculatePrice(order, opposite_order);
+            uint32_t price = LimitOrder::CalculatePrice(order, opposite_order);
             uint32_t quantity = std::min(order->quantity(), opposite_order->quantity());
             opposite_order->Fill(quantity);
             order->Fill(quantity);
